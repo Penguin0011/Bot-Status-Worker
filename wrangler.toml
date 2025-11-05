@@ -1,0 +1,13 @@
+# Worker name updated to bot-status
+name = "bot-status"
+main = "worker.js"
+compatibility_date = "2025-09-15"
+
+[durable_objects]
+bindings = [
+  { name = "UPTIME_STORAGE", class_name = "UptimeStorage" },
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UptimeStorage"]
