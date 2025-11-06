@@ -1,16 +1,33 @@
 export class UptimeStorage {
   constructor(state, env) {
     this.state = state;
+
+    // In-memory state
     this.heartbeats = [];
     this.lastHeartbeat = null;
-    this.maintenance = false; // <-- NEW: State for maintenance mode
+    this.maintenance = false;
+    this.lastOfflineRecordedForHeartbeatTime = null;
+
+    // Constants
+    this.HEARTBEAT_TOLERANCE_SECONDS = 90; // Offline threshold
+    this.HEARTBEAT_INTERVAL_SECONDS = 60; // Expected heartbeat cadence
+    this.RETENTION_MS = 48 * 60 * 60 * 1000; // Keep last 48h of entries
 
     // Load all state from persistent storage on startup
-    this.state.storage.get(['heartbeats', 'lastHeartbeat', 'maintenance']).then(data => {
-      this.heartbeats = data.get('heartbeats') || [];
-      this.lastHeartbeat = data.get('lastHeartbeat') || null;
-      this.maintenance = data.get('maintenance') || false;
-    });
+    this.state.storage
+      .get([
+        'heartbeats',
+        'lastHeartbeat',
+        'maintenance',
+        'lastOfflineRecordedForHeartbeatTime',
+      ])
+      .then((data) => {
+        this.heartbeats = data.get('heartbeats') || [];
+        this.lastHeartbeat = data.get('lastHeartbeat') || null;
+        this.maintenance = data.get('maintenance') || false;
+        this.lastOfflineRecordedForHeartbeatTime =
+          data.get('lastOfflineRecordedForHeartbeatTime') || null;
+      });
   }
 
   async fetch(request) {
@@ -22,7 +39,6 @@ export class UptimeStorage {
         return this.handleHeartbeat(request);
       case '/status':
         return this.handleStatus();
-      // --- NEW: Endpoints to control maintenance mode ---
       case '/maintenance/enable':
         return this.handleMaintenance(true);
       case '/maintenance/disable':
@@ -32,55 +48,122 @@ export class UptimeStorage {
     }
   }
 
-  // --- NEW: Method to set maintenance mode ---
+  // Alarm callback used to detect and persist "offline" heartbeats
+  async alarm() {
+    try {
+      if (this.maintenance) return;
+      if (!this.lastHeartbeat) return;
+
+      const lastTimeMs = new Date(this.lastHeartbeat.time).getTime();
+      const ageMs = Date.now() - lastTimeMs;
+
+      if (
+        ageMs > this.HEARTBEAT_TOLERANCE_SECONDS * 1000 &&
+        this.lastOfflineRecordedForHeartbeatTime !== this.lastHeartbeat.time
+      ) {
+        const offlineEntry = {
+          status: 0,
+            // Synthetic offline marker
+          time: new Date().toISOString(),
+          offline: true,
+          for: this.lastHeartbeat.time
+        };
+
+        this.heartbeats.unshift(offlineEntry);
+        this.pruneOld();
+
+        this.lastOfflineRecordedForHeartbeatTime = this.lastHeartbeat.time;
+
+        await this.state.storage.put({
+          heartbeats: this.heartbeats,
+          lastOfflineRecordedForHeartbeatTime:
+            this.lastOfflineRecordedForHeartbeatTime
+        });
+      }
+    } catch (e) {
+      console.error('Alarm error:', e);
+    }
+  }
+
   async handleMaintenance(enable) {
     this.maintenance = enable;
-    await this.state.storage.put('maintenance', this.maintenance); // Persist state
-    return new Response(JSON.stringify({
-      success: true,
-      message: `Maintenance mode ${enable ? 'enabled' : 'disabled'}.`
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+    const now = new Date().toISOString();
+    const maintenanceEvent = {
+      status: 2,
+      time: now,
+      maintenance: true,
+      event: enable ? 'maintenance_start' : 'maintenance_end'
+    };
+
+    this.heartbeats.unshift(maintenanceEvent);
+    this.pruneOld();
+
+    await this.state.storage.put({
+      maintenance: this.maintenance,
+      heartbeats: this.heartbeats
+    });
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        message: `Maintenance mode ${enable ? 'enabled' : 'disabled'}.`
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
   }
 
   handleStatus() {
-    // --- NEW: Check for maintenance mode first ---
     if (this.maintenance) {
-      return new Response(JSON.stringify({
-        status: 2, // Maintenance status
-        uptime: 100, // Uptime is not degraded during planned maintenance
-        lastCheck: this.lastHeartbeat?.time || null,
-        heartbeatList: [], // Don't show heartbeats during maintenance
-        message: "Bot is currently under planned maintenance."
-      }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-      });
+      return new Response(
+        JSON.stringify({
+          status: 2,
+          uptime: 100,
+          lastCheck: this.lastHeartbeat?.time || null,
+          heartbeatList: [],
+          message: 'Bot is currently under planned maintenance.'
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        }
+      );
     }
 
-    const HEARTBEAT_TOLERANCE = 90; // 90 seconds
-    let status = 0; // Offline
-    
+    let status = 0;
     if (this.lastHeartbeat) {
-      const timeSinceLast = (Date.now() - new Date(this.lastHeartbeat.time).getTime()) / 1000;
-      if (timeSinceLast <= HEARTBEAT_TOLERANCE) {
-        status = 1; // Online
+      const timeSinceLastSeconds =
+        (Date.now() - new Date(this.lastHeartbeat.time).getTime()) / 1000;
+      if (timeSinceLastSeconds <= this.HEARTBEAT_TOLERANCE_SECONDS) {
+        status = 1;
       }
     }
 
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-    const recentHeartbeats = this.heartbeats.filter(hb => new Date(hb.time).getTime() >= oneDayAgo);
-    
+    const recentHeartbeats = this.heartbeats.filter(
+      (hb) => new Date(hb.time).getTime() >= oneDayAgo
+    );
+
     const uptime = this.calculateUptime(recentHeartbeats);
 
-    return new Response(JSON.stringify({
-      status,
-      uptime,
-      lastCheck: this.lastHeartbeat?.time || null,
-      heartbeatList: recentHeartbeats,
-    }), {
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-    });
+    return new Response(
+      JSON.stringify({
+        status,
+        uptime,
+        lastCheck: this.lastHeartbeat?.time || null,
+        heartbeatList: recentHeartbeats
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      }
+    );
   }
-  
+
   async handleHeartbeat(request) {
     const timestamp = new Date().toISOString();
     let requestData = {};
@@ -88,36 +171,56 @@ export class UptimeStorage {
       if (request.headers.get('Content-Type')?.includes('application/json')) {
         requestData = await request.json();
       }
-    } catch (e) { /* Ignore */ }
+    } catch {}
 
     const heartbeatData = {
       status: 1,
       time: timestamp,
-      ping: requestData.ping !== undefined ? Math.round(requestData.ping) : undefined,
+      ping:
+        requestData.ping !== undefined
+          ? Math.round(requestData.ping)
+          : undefined
     };
 
     this.lastHeartbeat = heartbeatData;
     this.heartbeats.unshift(heartbeatData);
-
-    const twoDaysAgo = Date.now() - 48 * 60 * 60 * 1000;
-    this.heartbeats = this.heartbeats.filter(hb => new Date(hb.time).getTime() > twoDaysAgo);
+    this.lastOfflineRecordedForHeartbeatTime = null; // reset on new heartbeat
+    this.pruneOld();
 
     await this.state.storage.put({
-      'lastHeartbeat': this.lastHeartbeat,
-      'heartbeats': this.heartbeats,
+      lastHeartbeat: this.lastHeartbeat,
+      heartbeats: this.heartbeats,
+      lastOfflineRecordedForHeartbeatTime:
+        this.lastOfflineRecordedForHeartbeatTime
     });
-    
-    return new Response(JSON.stringify({ success: true, message: 'Heartbeat recorded' }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
+
+    await this.state.storage.setAlarm(
+      Date.now() + this.HEARTBEAT_TOLERANCE_SECONDS * 1000
+    );
+
+    return new Response(
+      JSON.stringify({ success: true, message: 'Heartbeat recorded' }),
+      {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      }
+    );
   }
 
   calculateUptime(heartbeatList) {
-    if (heartbeatList.length === 0) return 0;
-    const HEARTBEAT_INTERVAL = 60;
-    const expected = (24 * 60 * 60) / HEARTBEAT_INTERVAL;
-    const percentage = Math.min((heartbeatList.length / expected) * 100, 100);
+    if (!heartbeatList || heartbeatList.length === 0) return 0;
+
+    const expected =
+      (24 * 60 * 60) / this.HEARTBEAT_INTERVAL_SECONDS; // 1440 at 60s
+    const onlineCount = heartbeatList.filter((hb) => hb.status === 1).length;
+    const percentage = Math.min((onlineCount / expected) * 100, 100);
     return Math.round(percentage * 100) / 100;
+  }
+
+  pruneOld() {
+    const cutoff = Date.now() - this.RETENTION_MS;
+    this.heartbeats = this.heartbeats.filter(
+      (hb) => new Date(hb.time).getTime() > cutoff
+    );
   }
 }
