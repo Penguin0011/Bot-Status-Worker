@@ -1,144 +1,96 @@
-# Bot Status Worker (Durable Objects)
+# Bot Status Worker
 
-Cloudflare Worker that tracks Discord bot uptime via heartbeats, powered by Durable Objects (DO) for low-latency, low-write storage. Supports:
-- Backward-compatible endpoints (`/heartbeat`, `/api/status`)
-- Parallel multi-bot endpoints (`/:bot/heartbeat`, `/:bot/status`)
-- Maintenance mode with `status: 2`
-- Optional `ping` metric in heartbeat POST body
-- CORS for public status reads
-- NEW: Synthetic persisted events for:
-  - Offline transitions (status `0`) when heartbeats stop for >90s
-  - Maintenance start/end (status `2`)
+This repository contains a Cloudflare Worker + Durable Object that records periodic heartbeats from your bot(s) and provides status, history and health endpoints for monitoring and a small web integration widget.
 
-## Endpoints
+Highlights
+- Durable Object stores heartbeat history and manages offline detection using alarms.
+- Synthetic offline markers are inserted when a heartbeat goes stale (alarm) or as a fallback on the next read if alarms did not run.
+- New endpoints: `/api/health`, `/api/history?limit=…` and `/api/status` (returns both raw and adjusted uptime).
+- Web integration: small embeddable widget that checks `/api/health`, `/api/status` and `/api/history` and renders a minimal status card.
 
-Public (no auth):
-- GET `/api/status` → Default bot status
-- GET `/:bot/status` → Status for the specified bot
+Quick endpoints summary
+- POST /heartbeat (protected)  
+  - Records a heartbeat. JSON body optional: { "ping": 123 }  
+  - Auth: Bearer token must match AUTH_TOKEN env var.
+- GET /api/status  
+  - Returns full state for the last 24 hours (heartbeatList), plus:
+    - status: 0 offline, 1 online, 2 maintenance
+    - uptime: raw uptime percentage (slot-based)
+    - uptimeAdjusted: adjusted uptime that ignores "late" synthetic offline markers (see below)
+  - CORS enabled.
+- GET /api/health  
+  - Minimal endpoint useful for external monitors (small response, fast).  
+  - Returns HTTP 200 when online and when in maintenance (maintenance is considered an intentional healthy state). Returns 503 when offline. Response body includes { ok, status, lastCheck }.
+  - Use this endpoint for availability checks (pings, uptime robot, etc).
+- GET /api/history?limit=NN  
+  - Returns the most recent heartbeats up to `limit` (default 100, max 1000). Useful for paginating history in the UI.
 
-Authenticated (Bearer AUTH_TOKEN):
-- POST `/heartbeat` → Default bot heartbeat
-- POST `/:bot/heartbeat` → Named bot heartbeat
-- POST `/api/maintenance/enable|disable` → Maintenance for default bot
-- POST `/:bot/maintenance/enable|disable` → Maintenance for named bot
+What changed / new details
 
-Status codes:
-- `0` = offline (no heartbeat within 90s)
-- `1` = online (heartbeat seen within 90s)
-- `2` = maintenance (explicitly enabled)
+1) /api/health (minimal monitor-friendly)
+- Behavior:
+  - If the Durable Object is in maintenance mode -> returns HTTP 200 and JSON { ok: true, status: 2, mode: 'maintenance', lastCheck }.
+  - If last heartbeat is within HEARTBEAT_TOLERANCE_SECONDS (default 90s) -> returns HTTP 200 and JSON { ok: true, status: 1, lastCheck }.
+  - If no heartbeat within tolerance -> returns HTTP 503 and JSON { ok: false, status: 0, lastCheck }.
+- Use-case: configured as an external service monitor check, alerting on 503.
 
-## New Behavior
+2) /api/history?limit=…
+- Pagination:
+  - Query parameter `limit` controls how many items are returned (default 100, capped at 1000).
+  - Response: { limit, count, total, items: [...] } where items is an array ordered newest-first.
+- Use-case: load the heartbeat history incrementally in dashboards.
 
-### Offline Recording
-When the last heartbeat ages beyond 90 seconds, an alarm inserts one synthetic offline event:
-```json
-{
-  "status": 0,
-  "time": "2025-01-01T00:00:00.000Z",
-  "offline": true,
-  "for": "2025-01-01T00:00:00.000Z"
-}
-```
-Only one offline entry per offline transition (per last online heartbeat). Retained for 48h.
+3) uptimeAdjusted — secondary uptime metric
+- Purpose:
+  - Some synthetic offline markers are created as a fallback when the alarm hasn't run or the worker was cold and a read triggered insertion later. Those late-inserted offline events can artificially lower SLA numbers when the system actually had no observed outage.
+  - `uptimeAdjusted` ignores synthetic offline markers that were inserted "late" — i.e., the offline marker's recordedAt time is later than the offline moment by more than a configurable threshold — so your SLA calculation doesn't get penalized by late instrumentation.
+- How it works:
+  - Each synthetic offline entry includes:
+    - `insertionMode`: "alarm" (timely alarm insertion) or "fallback" (read-time insertion).
+    - `time`: the theoretical offline moment (lastHeartbeat.time + HEARTBEAT_TOLERANCE_SECONDS).
+    - `recordedAt`: when the synthetic entry was actually inserted into storage.
+  - If (recordedAt - time) > LATE_OFFLINE_EXCLUSION_HOURS (default 6 hours) the offline marker is considered "late" and is ignored for adjusted uptime calculation (the slot counts as online for uptimeAdjusted).
+  - Alarm-inserted offline entries are normally near-instant and are counted as offline for both raw and adjusted uptime.
 
-### Maintenance Recording
-Enabling/disabling maintenance inserts:
-```json
-{ "status": 2, "time": "...", "maintenance": true, "event": "maintenance_start" }
-{ "status": 2, "time": "...", "maintenance": true, "event": "maintenance_end" }
-```
-During active maintenance `/status` hides the heartbeatList (but events are still stored).
+Configuration / environment
+- HEARTBEAT_TOLERANCE_SECONDS (hard-coded default in worker: 90s) — threshold to declare offline.
+- HEARTBEAT_INTERVAL_SECONDS (default 60s) — expected heartbeat cadence used for slot-based calculations.
+- RETENTION_MS (default 48h) — how long to retain heartbeat records.
+- LATE_OFFLINE_EXCLUSION_HOURS (default 6) — env var you can set to change the threshold used for adjusted uptime. Example:
+  - Set in Wrangler / Cloudflare environment variables:
+    - For Wrangler (local deployment), add to `wrangler.toml` [vars] or as a secret:
+      ```
+      [vars]
+      LATE_OFFLINE_EXCLUSION_HOURS = "6"
+      ```
+    - Or set in Cloudflare dashboard for the Worker binding.
 
-### Uptime Calculation
-Counts only `status === 1` heartbeats in last 24h (ignores synthetic offline and maintenance entries). Expected heartbeat cadence: every 60s (max 1440/day).
+Example curl usages
+- Health:
+  - curl -i -H 'Cache-Control: no-cache' https://<YOUR_WORKER>/api/health
+- Status:
+  - curl -H 'Cache-Control: no-cache' https://<YOUR_WORKER>/api/status
+- History (limit 50):
+  - curl -H 'Cache-Control: no-cache' 'https://<YOUR_WORKER>/api/history?limit=50'
+- Heartbeat (protected):
+  - curl -X POST -H "Authorization: Bearer $AUTH_TOKEN" -H "Content-Type: application/json" -d '{"ping":76}' https://<YOUR_WORKER>/heartbeat
 
-## Deploy
+Web integration example
+- A minimal embeddable widget is provided in `web/` that:
+  - Uses `/api/health` to get a fast decision for monitoring.
+  - Fetches `/api/status` to populate a small card showing `status`, `uptime` and `uptimeAdjusted`.
+  - Optionally fetches `/api/history?limit=...` to show a short event list.
 
-1. Prereqs
-   - Node 18+, Wrangler: `npm i -g wrangler`
-   - Cloudflare account: `wrangler login`
-2. Secret
-```
-wrangler secret put AUTH_TOKEN
-```
-3. Deploy
-```
-wrangler deploy
-```
+Embedding
+1. Copy `web/index.html` and `web/status-widget.js` to your static site (or reference them directly).
+2. Edit the `DATA_URL` in `web/status-widget.js` if you host the worker at a different path.
+3. Include `<div id="bot-status-widget"></div>` and `<script src="status-widget.js"></script>` into your page.
 
-## Quick Test
+Notes and next improvements
+- Consider switching slot-based uptime percentages to duration-based uptime (compute time gaps between online heartbeats to better represent outages that are not aligned to one-minute slots).
+- Cursor-based pagination for `/api/history` (e.g. after=<ISO>) can be added if you need deep history browsing.
+- You can customize the health behavior to return 503 during maintenance if preferred (currently maintenance returns 200 intentionally).
 
-Send heartbeat:
-```
-curl -X POST https://bot-status.<your-subdomain>.workers.dev/heartbeat \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
-
-Read status:
-```
-curl https://bot-status.<your-subdomain>.workers.dev/api/status
-```
-
-Maintenance enable:
-```
-curl -X POST https://bot-status.<your-subdomain>.workers.dev/api/maintenance/enable \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
-
-Maintenance disable:
-```
-curl -X POST https://bot-status.<your-subdomain>.workers.dev/api/maintenance/disable \
-  -H "Authorization: Bearer YOUR_TOKEN"
-```
-
-## Discord Bot Integration (Python)
-
-```python
-from discord.ext import tasks, commands
-import aiohttp, os
-
-class pushstatus(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.heartbeat_url = "https://bot-status.<your-subdomain>.workers.dev/heartbeat"
-        self.auth_token = os.getenv('PUSHTOKEN')
-        self.pushstatus.start()
-
-    @tasks.loop(seconds=60)
-    async def pushstatus(self):
-        ping_ms = round(self.bot.latency * 1000)
-        try:
-            async with aiohttp.ClientSession() as session:
-                headers = {"Authorization": f"Bearer {self.auth_token}", "Content-Type": "application/json"}
-                payload = {"ping": ping_ms}
-                async with session.post(self.heartbeat_url, headers=headers, json=payload) as r:
-                    if r.status != 200:
-                        print("Heartbeat failed", r.status)
-        except Exception as e:
-            print("Heartbeat error:", e)
-
-    @pushstatus.before_loop
-    async def before_pushstatus(self):
-        await self.bot.wait_until_ready()
-```
-
-## Rate Limits & Scaling
-- ~100k Worker requests/day (free plan).
-- Each bot @ 60s heartbeat ≈ 1,440 req/day.
-- Synthetic offline events add minimal overhead (1 per outage).
-- Maintenance events add 2 per window.
-
-## Troubleshooting
-- 401: token mismatch.
-- Offline too soon: ensure loop interval ≤ 60s.
-- Uptime low: missed intervals or maintenance not hidden (active maintenance returns empty heartbeatList).
-- No offline event: ensure alarms supported in DO (check Wrangler config).
-
-## Security
-- Rotate AUTH_TOKEN periodically.
-- Only status endpoints are public.
-
-## Future Ideas
-- Query param to reveal heartbeats during active maintenance.
-- Aggregate downtime & maintenance durations.
-- Compression or pagination for heartbeat history.
+If you'd like, I can:
+- Commit these README and web integration files into a branch and open a PR for you.
+- Implement cursor pagination (/history?after=ISO) or switch uptime to a duration-based algorithm next.
