@@ -1,201 +1,153 @@
-# Web Integration Guide - Bot Status API
+# Web Integration Notes — Bot Status Worker
 
-**For AI/Developers building status display websites**
+This document explains how to integrate a web UI, dashboard, or external monitor with the Bot Status Worker.
 
-## API Endpoint
+Endpoints overview
+- GET /api/health
+  - Simple, low-latency health check. Returns 200 when healthy/maintenance; 503 when offline.
+  - Use for frequent polling (30–60s checks).
+- GET /api/status
+  - Full status payload for dashboards, includes uptime, uptimeAdjusted, lastCheck, and recent heartbeatList.
+  - Use for detailed pages or occasional refreshes.
+- GET /api/history?limit=<n>
+  - Returns recent events (newest-first) up to `limit`. Default 100, max 1000.
+  - Use this for timeline views or exporting recent logs.
+- POST /heartbeat
+  - Protected endpoint used by the bot to post heartbeats. Must include Authorization header.
+- POST /maintenance/enable and POST /maintenance/disable
+  - Protected endpoints to declare planned maintenance windows.
 
-```
-GET https://YOUR-WORKER.workers.dev/api/status
-```
+Design recommendations for a web dashboard
 
-No authentication required. CORS enabled.
+1. Polling strategy
+- Use /api/health for frequent monitoring (every 30–60s). This is small and returns an appropriate HTTP status code for most monitors.
+- Use /api/status for UI refreshes or when the user opens a dashboard (every 30–120s).
+- Avoid aggressive polling of /api/status in high-traffic pages—fetch it in the background only when needed.
 
-## Response Format
+2. Using uptimeAdjusted vs uptime
+- uptime (raw):
+  - Slot-based: counts received online heartbeat slots over the last 24 hours (default cadence 60s).
+  - Use this for a strict "what did the store see" view.
+- uptimeAdjusted:
+  - Ignores synthetic offline markers that were inserted long after their theoretical offline time.
+  - Useful when your Durable Object might be cold or status reads are infrequent: prevents a single delayed read from retroactively degrading the SLA.
+- Dashboard suggestion:
+  - Show uptimeAdjusted as primary SLA metric.
+  - Show uptime (raw) as secondary or in an "advanced metrics" section with explanation.
 
-```json
-{
-  "status": 1,
-  "uptime": 99.52,
-  "lastCheck": "2025-01-01T10:00:00.000Z",
-  "heartbeatList": [
-    {
-      "status": 1,
-      "time": "2025-01-01T10:00:00.000Z",
-      "ping": 45
-    },
-    {
-      "status": 0,
-      "time": "2025-01-01T09:30:30.000Z",
-      "offline": true,
-      "for": "2025-01-01T09:29:00.000Z"
-    },
-    {
-      "status": 2,
-      "time": "2025-01-01T08:00:00.000Z",
-      "maintenance": true,
-      "event": "maintenance_start"
-    },
-    {
-      "status": 2,
-      "time": "2025-01-01T08:30:00.000Z",
-      "maintenance": true,
-      "event": "maintenance_end"
-    }
-  ]
-}
-```
-
-## Field Interpretations
-
-### `status`
-Current live state:
-| Value | Meaning      | Color        | Text          |
-|-------|--------------|--------------|---------------|
-| 0     | Offline      | Red (#ef4444)| Offline       |
-| 1     | Online       | Green (#22c55e)| Online      |
-| 2     | Maintenance  | Orange (#f59e0b)| Maintenance |
-
-### Synthetic Heartbeat Fields
-- `offline: true` + `status: 0`: A recorded offline transition (inserted once when tolerance exceeded). `for` points to the last online heartbeat time.
-- `maintenance: true` + `status: 2`: A maintenance transition event. `event` is one of:
-  - `maintenance_start`
-  - `maintenance_end`
-
-These appear in `heartbeatList` only when maintenance is not actively enabled (during active maintenance the list is intentionally hidden).
-
-### `uptime`
-Percentage of ONLINE (status=1) heartbeats vs expected (1440 per 24h at 60s interval). Synthetic offline or maintenance entries are excluded from uptime math.
-
-### `lastCheck`
-Timestamp of the most recent real (status=1) heartbeat.
-
-### `heartbeatList`
-Newest first. May include:
-- Real heartbeats: `{status:1,time,...,ping?}`
-- Offline markers: `{status:0,offline:true,for:<iso>}`
-- Maintenance markers: `{status:2,maintenance:true,event:'maintenance_start'|'maintenance_end'}`
-
-## Visual Strategies
-
-### Timeline Rendering
-1. Sort by time ascending to build a 24h bar.
-2. Mark segments:
-   - Online minute → green.
-   - Offline marker → start a red segment until next online heartbeat.
-   - Maintenance start → orange segment until maintenance end.
-
-### Distinguishing Maintenance vs Outage
-If a maintenance window exists (start/end pair), treat that duration separately:
-- Show “Scheduled Maintenance” badge.
-- Exclude maintenance duration from downtime charts if you want “unplanned” MTTR.
-
-### Minimal Badge
-
-```javascript
-async function updateStatus() {
-  const res = await fetch('https://YOUR-WORKER.workers.dev/api/status');
-  const data = await res.json();
-
-  const statusMap = {
-    0: { text: 'Offline', color: '#ef4444' },
-    1: { text: 'Online', color: '#22c55e' },
-    2: { text: 'Maintenance', color: '#f59e0b' }
-  };
-
-  const s = statusMap[data.status] || statusMap[0];
-  document.getElementById('status-indicator').style.backgroundColor = s.color;
-  document.getElementById('status-text').textContent = s.text;
-  document.getElementById('uptime-text').textContent = `${data.uptime.toFixed(2)}% uptime`;
-}
-setInterval(updateStatus, 30000);
-updateStatus();
-```
-
-### Parsing Synthetic Events
-
-```javascript
-function classifyHeartbeat(h) {
-  if (h.offline) return { type: 'offline', time: h.time, for: h.for };
-  if (h.maintenance) return { type: h.event, time: h.time };
-  return { type: 'online', time: h.time, ping: h.ping };
-}
-
-const events = data.heartbeatList.map(classifyHeartbeat);
-```
-
-### Computing Downtime (Unplanned Only)
-
-```javascript
-function computeUnplannedDowntime(events) {
-  // We consider periods after an offline marker until the next 'online' event
-  let totalMs = 0;
-  for (let i = 0; i < events.length; i++) {
-    if (events[i].type === 'offline') {
-      // Look forward for next online
-      const start = new Date(events[i].time).getTime();
-      let end = Date.now();
-      for (let j = i + 1; j < events.length; j++) {
-        if (events[j].type === 'online') {
-          end = new Date(events[j].time).getTime();
-          break;
-        }
-        if (events[j].type === 'maintenance_start') {
-          // Stop counting unplanned downtime once maintenance starts (optional rule)
-          end = new Date(events[j].time).getTime();
-          break;
-        }
-      }
-      totalMs += Math.max(0, end - start);
-    }
+3. Handling synthetic offline markers
+- Two kinds of synthetic offline entries:
+  - insertionMode: "alarm" — inserted by the DO alarm at the expected offline moment (timely).
+  - insertionMode: "fallback" — inserted on a read when the DO previously didn't insert an alarm record (late insert).
+- Both are persisted in heartbeatList and should be shown in timelines, but can be annotated visually:
+  - "Observed offline" for alarm entries.
+  - "Inferred offline (fallback)" for fallback entries, possibly with a "recordedAt" timestamp to indicate the insertion was delayed.
+- Example synthetic offline entry:
+  {
+    status: 0,
+    time: "2025-11-06T21:26:16.460Z",         // theoretical offline moment
+    offline: true,
+    for: "2025-11-06T21:24:46.459Z",          // last heartbeat that went stale
+    insertionMode: "fallback",
+    recordedAt: "2025-11-06T22:09:00.000Z"    // when the marker was inserted
   }
-  return totalMs;
+
+4. Pagination & timeline UI
+- Use /api/history?limit=100 (or larger) for initial load.
+- For long time ranges, implement cursor-based paging on the client (e.g., fetch newest N, then request older items with offset or a timestamp filter).
+- If you need server-side cursor support, consider adding ?after=<ISO> or ?before=<ISO> to the worker.
+
+5. Interpreting status transitions
+- The worker stores heartbeats newest-first. To detect transitions:
+  - Look for a status:0 synthetic offline entry followed later by a status:1 heartbeat — indicates offline -> recovery.
+  - Combine heartbeat timestamps with ping values for richer diagnostics.
+- If an offline event's insertionMode is "fallback" and recordedAt is long after the offline time, display a tooltip: "This offline marker was inferred when the dashboard polled; it may have been recorded late."
+
+6. Example UI flow (timeline)
+- Fetch /api/history?limit=200 and show newest-first.
+- For each item:
+  - status:1 — show green dot with ping value.
+  - status:0 — show red dot and "offline" label, show for+time and insertionMode details.
+  - status:2 — show maintenance marker (neutral color) with event text.
+- Implement a filtering option: show/hide fallback entries or highlight them.
+
+7. Monitor integration (external monitoring)
+- Use /api/health for simple monitors:
+  - HTTP 200 → healthy (or maintenance).
+  - HTTP 503 → unhealthy/offline.
+- Include Cache-Control: no-cache in check requests to avoid cached responses:
+  - curl -H 'Cache-Control: no-cache' https://<domain>/api/health
+- Polling cadence:
+  - 30–60s for UptimeRobot-type services.
+  - If you expect bursts of short outages, set your monitor to a frequency that balances false positives vs detection speed.
+
+8. Handling maintenance windows
+- When you plan maintenance, call POST /maintenance/enable (with auth).
+- The worker will:
+  - Insert a maintenance event (status:2) and suppress offline insertions during maintenance.
+- After maintenance, call POST /maintenance/disable to resume normal detection.
+
+9. Error handling & edge cases
+- If /api/status shows status:1 but /api/health returns 503:
+  - Unlikely (health derives from last heartbeat). If observed, confirm the request used 'no-cache' and the same botName path.
+- If you see many fallback offline entries:
+  - The DO alarms may not be firing reliably (cold DO or scheduling delays). The fallback is intentional and preserves an audit trail; consider tuning LATE_OFFLINE_EXCLUSION_HOURS if you want to ignore very-late records in SLA calculations.
+- If you need strict time-based uptime rather than slot-based:
+  - Consider computing uptime from gaps between heartbeats (duration-based) and modify the worker accordingly.
+
+10. Example JavaScript snippets
+
+Fetch health (50s polling recommended)
+```js
+async function fetchHealth(domain) {
+  const res = await fetch(`${domain}/api/health`, { headers: { 'Cache-Control': 'no-cache' } });
+  if (res.status === 200) {
+    const json = await res.json();
+    // ok or maintenance
+    return { healthy: json.ok, status: json.status, lastCheck: json.lastCheck };
+  } else {
+    // 503 or other -> unhealthy
+    return { healthy: false, status: 0 };
+  }
 }
 ```
 
-## Edge Cases
-
-### Active Maintenance
-Response hides heartbeatList; you may request again after maintenance end to rebuild history.
-
-### Rapid Flapping
-Multiple offline segments will still produce only one offline marker per missed window because a new online heartbeat resets tracking.
-
-### No Heartbeats Yet
-Show “Waiting for first heartbeat”.
-
-## Refresh Strategy
-- Poll every 30–60s.
-- Backoff when offline:
-```javascript
-let interval = 30000;
-async function loop() {
-  const res = await fetch('.../api/status');
+Fetch status for dashboard
+```js
+async function fetchStatus(domain) {
+  const res = await fetch(`${domain}/api/status`, { headers: { 'Cache-Control': 'no-cache' } });
   const data = await res.json();
-  interval = data.status === 0 ? Math.min(interval * 1.5, 300000) : 30000;
-  setTimeout(loop, interval);
+  // data.status, data.uptime, data.uptimeAdjusted, data.heartbeatList
+  return data;
 }
-loop();
 ```
 
-## Accessibility
-Use text + color + icons (e.g., 🔴 🟢 🟠) with `aria-live="polite"` for status updates.
-
-## Testing Checklist
-1. Simulate online heartbeat stream.
-2. Stop heartbeats → verify offline marker appears after ~90s.
-3. Resume heartbeats → marker stops; uptime recovers gradually.
-4. Maintenance enable/disable → events recorded correctly.
-5. Verify uptime excludes synthetic (status 0 & 2) events.
-
-## Quick Reference
-
-```javascript
-const { status, uptime, lastCheck, heartbeatList } = data;
-
-const syntheticCounts = {
-  offline: heartbeatList.filter(h => h.offline).length,
-  maintenanceEvents: heartbeatList.filter(h => h.maintenance).length
-};
-
-const onlineHeartbeats = heartbeatList.filter(h => h.status === 1).length;
+Fetch history (paginated)
+```js
+async function fetchHistory(domain, limit = 200) {
+  const res = await fetch(`${domain}/api/history?limit=${limit}`, { headers: { 'Cache-Control': 'no-cache' } });
+  return await res.json(); // { limit, count, total, items }
+}
 ```
+
+11. Visual / UX tips
+- Show uptimeAdjusted prominently and explain its behavior in a tooltip (why certain offline markers are ignored).
+- Color-code events:
+  - Green = heartbeat (online)
+  - Red = synthetic offline (alarm)
+  - Orange/Dashed = synthetic offline (fallback)
+  - Gray = maintenance
+- Provide a small legend clarifying insertionMode and recordedAt semantics.
+
+12. Further enhancements to consider
+- Cursor-based history endpoints (`after`, `before`) for efficient scrolling.
+- Duration-based uptime (compute total offline time vs online time) for more precise SLA reporting.
+- Per-bot configuration: allow each bot to set a custom tolerance or cadence.
+- Alert webhooks on status transitions.
+
+Appendix — Synthetic offline behavior summary
+- Alarm path: DO schedules an alarm for lastHeartbeat + HEARTBEAT_TOLERANCE_SECONDS on each heartbeat. If it fires and the heartbeat is stale, DO inserts a synthetic offline event with insertionMode: "alarm" and recordedAt ~= time of insertion.
+- Fallback path: If the alarm didn't fire (e.g., cold DO), the next /api/status read detects the stale lastHeartbeat and inserts a synthetic offline event with insertionMode: "fallback" and recordedAt that is substantially later than the theoretical offline time. The entry is persisted so the history is complete.
+- Use insertionMode and recordedAt to annotate, filter, or exclude late/inferred offline markers in dashboard analytics.
+
+This should give a clear and practical integration guide for building dashboards, monitoring checks, and automations around the Bot Status Worker.
