@@ -43,6 +43,7 @@ export class UptimeStorage {
   // Alarm for offline transition
   async alarm() {
     try {
+      console.log('ALARM fired; lastHeartbeat=', this.lastHeartbeat?.time);
       if (this.maintenance) return; // Do not mark offline during maintenance
       if (!this.lastHeartbeat) return;
 
@@ -99,7 +100,9 @@ export class UptimeStorage {
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
 
-  handleStatus() {
+    // REPLACE the entire handleStatus with this async version
+  async handleStatus() {
+    // Maintenance short-circuit
     if (this.maintenance) {
       return new Response(JSON.stringify({
         status: 2,
@@ -112,12 +115,42 @@ export class UptimeStorage {
       });
     }
 
+    // Compute status from last heartbeat age
     let status = 0;
+    let ageSec = Infinity;
+    let lastTimeMs = 0;
     if (this.lastHeartbeat) {
-      const ageSec = (Date.now() - new Date(this.lastHeartbeat.time).getTime()) / 1000;
+      lastTimeMs = new Date(this.lastHeartbeat.time).getTime();
+      ageSec = (Date.now() - lastTimeMs) / 1000;
       if (ageSec <= this.HEARTBEAT_TOLERANCE_SECONDS) status = 1;
     }
 
+    // Fallback: if offline and the alarm hasn't inserted an offline marker yet,
+    // create one now so the UI/history shows the transition reliably.
+    if (
+      status === 0 &&
+      this.lastHeartbeat &&
+      this.lastOfflineRecordedForHeartbeatTime !== this.lastHeartbeat.time
+    ) {
+      const offlineTimeMs = lastTimeMs + this.HEARTBEAT_TOLERANCE_SECONDS * 1000;
+      const offlineEntry = {
+        status: 0,
+        time: new Date(offlineTimeMs).toISOString(),
+        offline: true,
+        for: this.lastHeartbeat.time
+      };
+      this.heartbeats.unshift(offlineEntry);
+      this.lastOfflineRecordedForHeartbeatTime = this.lastHeartbeat.time;
+      this.pruneOld();
+
+      // Persist so subsequent reads see it without needing the alarm
+      await this.state.storage.put({
+        heartbeats: this.heartbeats,
+        lastOfflineRecordedForHeartbeatTime: this.lastOfflineRecordedForHeartbeatTime
+      });
+    }
+
+    // Uptime over last 24h, counting only status === 1
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const recent = this.heartbeats.filter(h => new Date(h.time).getTime() >= oneDayAgo);
     const uptime = this.calculateUptime(recent);
