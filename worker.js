@@ -1,6 +1,7 @@
 export class UptimeStorage {
   constructor(state, env) {
     this.state = state;
+    this.env = env;
 
     // In-memory state
     this.heartbeats = [];
@@ -8,12 +9,12 @@ export class UptimeStorage {
     this.maintenance = false;
     this.lastOfflineRecordedForHeartbeatTime = null;
 
-    // Constants
+    // Constants (defaults, can be adjusted in-code or via env where noted)
     this.HEARTBEAT_TOLERANCE_SECONDS = 90;   // Offline threshold
     this.HEARTBEAT_INTERVAL_SECONDS = 60;    // Expected heartbeat cadence
     this.RETENTION_MS = 48 * 60 * 60 * 1000; // Keep last 48h of entries
 
-    // Load persisted data
+    // Load persisted data (Durable Object storage)
     this.state.storage.get([
       'heartbeats',
       'lastHeartbeat',
@@ -28,23 +29,37 @@ export class UptimeStorage {
     });
   }
 
+  // helper to create JSON responses with consistent CORS
+  jsonResponse(obj, status = 200) {
+    return new Response(JSON.stringify(obj), {
+      status,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+
+  // fetch entrypoint (routes inside the DO)
   async fetch(request) {
     const url = new URL(request.url);
     const path = url.pathname;
+
     switch (path) {
       case '/heartbeat': return this.handleHeartbeat(request);
-      case '/status': return this.handleStatus();
+      case '/status': return this.handleStatus(request);
+      case '/health': return this.handleHealth(request);
+      case '/history': return this.handleHistory(request);
       case '/maintenance/enable': return this.handleMaintenance(true);
       case '/maintenance/disable': return this.handleMaintenance(false);
       default: return new Response('Not Found in Durable Object', { status: 404 });
     }
   }
 
-  // Alarm for offline transition
+  // Alarm callback used to detect and persist "offline" heartbeats
   async alarm() {
     try {
-      console.log('ALARM fired; lastHeartbeat=', this.lastHeartbeat?.time);
-      if (this.maintenance) return; // Do not mark offline during maintenance
+      if (this.maintenance) return;
       if (!this.lastHeartbeat) return;
 
       const lastTimeMs = new Date(this.lastHeartbeat.time).getTime();
@@ -54,13 +69,19 @@ export class UptimeStorage {
         ageMs > this.HEARTBEAT_TOLERANCE_SECONDS * 1000 &&
         this.lastOfflineRecordedForHeartbeatTime !== this.lastHeartbeat.time
       ) {
+        // The theoretical offline moment:
+        const offlineTimeMs = lastTimeMs + this.HEARTBEAT_TOLERANCE_SECONDS * 1000;
+        const now = new Date().toISOString();
+
         const offlineEntry = {
           status: 0,
-          time: new Date().toISOString(),
+          time: new Date(offlineTimeMs).toISOString(), // theoretical offline moment
           offline: true,
-          // reference the online heartbeat that went stale
-          for: this.lastHeartbeat.time
+          for: this.lastHeartbeat.time,
+          insertionMode: 'alarm',
+          recordedAt: now
         };
+
         this.heartbeats.unshift(offlineEntry);
         this.lastOfflineRecordedForHeartbeatTime = this.lastHeartbeat.time;
         this.pruneOld();
@@ -94,25 +115,54 @@ export class UptimeStorage {
       heartbeats: this.heartbeats
     });
 
-    return new Response(JSON.stringify({
+    return this.jsonResponse({
       success: true,
       message: `Maintenance mode ${enable ? 'enabled' : 'disabled'}.`
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }, 200);
   }
 
-    // REPLACE the entire handleStatus with this async version
+  // Health endpoint (minimal monitor-friendly)
+  handleHealth() {
+    if (this.maintenance) {
+      return this.jsonResponse({ ok: true, status: 2, lastCheck: this.lastHeartbeat?.time || null }, 200);
+    }
+
+    let status = 0;
+    if (this.lastHeartbeat) {
+      const ageSec = (Date.now() - new Date(this.lastHeartbeat.time).getTime()) / 1000;
+      if (ageSec <= this.HEARTBEAT_TOLERANCE_SECONDS) status = 1;
+    }
+
+    const ok = status === 1 || status === 2;
+    return this.jsonResponse({ ok, status, lastCheck: this.lastHeartbeat?.time || null }, ok ? 200 : 503);
+  }
+
+  // History endpoint (paginated newest-first)
+  handleHistory(request) {
+    const url = new URL(request.url);
+    const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '100', 1), 1), 1000);
+
+    const items = this.heartbeats.slice(0, limit); // newest-first
+    return this.jsonResponse({
+      limit,
+      count: items.length,
+      total: this.heartbeats.length,
+      items
+    });
+  }
+
+  // Status endpoint returns status, uptime, uptimeAdjusted, lastCheck, heartbeatList
   async handleStatus() {
     // Maintenance short-circuit
     if (this.maintenance) {
-      return new Response(JSON.stringify({
+      return this.jsonResponse({
         status: 2,
         uptime: 100,
+        uptimeAdjusted: 100,
         lastCheck: this.lastHeartbeat?.time || null,
         heartbeatList: [],
         message: 'Bot is currently under planned maintenance.'
-      }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-      });
+      }, 200);
     }
 
     // Compute status from last heartbeat age
@@ -132,12 +182,17 @@ export class UptimeStorage {
       this.lastHeartbeat &&
       this.lastOfflineRecordedForHeartbeatTime !== this.lastHeartbeat.time
     ) {
-      const offlineTimeMs = lastTimeMs + this.HEARTBEAT_TOLERANCE_SECONDS * 1000;
+      const lastTimeMsLocal = new Date(this.lastHeartbeat.time).getTime();
+      const offlineTimeMs = lastTimeMsLocal + this.HEARTBEAT_TOLERANCE_SECONDS * 1000;
+      const now = new Date().toISOString();
+
       const offlineEntry = {
         status: 0,
         time: new Date(offlineTimeMs).toISOString(),
         offline: true,
-        for: this.lastHeartbeat.time
+        for: this.lastHeartbeat.time,
+        insertionMode: 'fallback',
+        recordedAt: now
       };
       this.heartbeats.unshift(offlineEntry);
       this.lastOfflineRecordedForHeartbeatTime = this.lastHeartbeat.time;
@@ -150,19 +205,22 @@ export class UptimeStorage {
       });
     }
 
-    // Uptime over last 24h, counting only status === 1
+    // Uptime over last 24h, using slot-based raw uptime (status===1 counts)
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const recent = this.heartbeats.filter(h => new Date(h.time).getTime() >= oneDayAgo);
     const uptime = this.calculateUptime(recent);
 
-    return new Response(JSON.stringify({
+    // Compute uptimeAdjusted: exclude very-late synthetic offline markers from denominator
+    const lateExclusionHours = parseFloat(this.env.LATE_OFFLINE_EXCLUSION_HOURS) || 6;
+    const uptimeAdjusted = this.calculateUptimeAdjusted(recent, lateExclusionHours);
+
+    return this.jsonResponse({
       status,
       uptime,
+      uptimeAdjusted,
       lastCheck: this.lastHeartbeat?.time || null,
       heartbeatList: recent
-    }), {
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-    });
+    }, 200);
   }
 
   async handleHeartbeat(request) {
@@ -172,7 +230,7 @@ export class UptimeStorage {
       if (request.headers.get('Content-Type')?.includes('application/json')) {
         body = await request.json();
       }
-    } catch {}
+    } catch (e) {}
 
     const hb = {
       status: 1,
@@ -192,29 +250,48 @@ export class UptimeStorage {
       lastOfflineRecordedForHeartbeatTime: this.lastOfflineRecordedForHeartbeatTime
     });
 
-    // Schedule offline check
+    // Schedule offline check (alarm)
     await this.state.storage.setAlarm(Date.now() + this.HEARTBEAT_TOLERANCE_SECONDS * 1000);
 
-    return new Response(JSON.stringify({ success: true, message: 'Heartbeat recorded' }), {
-      status: 200, headers: { 'Content-Type': 'application/json' }
-    });
+    return this.jsonResponse({ success: true, message: 'Heartbeat recorded' }, 200);
   }
 
-  // Only count status === 1 heartbeats towards uptime
+  // Only count status === 1 heartbeats towards uptime (slot-based)
   calculateUptime(list) {
-    if (!list.length) return 0;
-    const expected = (24 * 60 * 60) / this.HEARTBEAT_INTERVAL_SECONDS; // 1440
+    if (!list || !list.length) return 0;
+    const expected = (24 * 60 * 60) / this.HEARTBEAT_INTERVAL_SECONDS; // 1440 for 60s
     const online = list.filter(h => h.status === 1).length;
     const pct = Math.min((online / expected) * 100, 100);
     return Math.round(pct * 100) / 100;
   }
 
-  // Prune to 48h
+  // Compute uptimeAdjusted by excluding late synthetic offline markers from the denominator.
+  // This follows the README: if a synthetic offline (fallback) was recorded long after the theoretical offline time,
+  // treat that slot as excluded from the denominator (don't penalize SLA).
+  calculateUptimeAdjusted(recentList, lateExclusionHours) {
+    if (!recentList || !recentList.length) return 0;
+    const expected = (24 * 60 * 60) / this.HEARTBEAT_INTERVAL_SECONDS; // 1440
+
+    const online = recentList.filter(h => h.status === 1).length;
+
+    // Count late fallback synthetic offline markers within the 24h window
+    const lateThresholdMs = lateExclusionHours * 60 * 60 * 1000;
+    const lateFallbackCount = recentList.filter(h =>
+      h.status === 0 &&
+      h.insertionMode === 'fallback' &&
+      h.recordedAt &&
+      (new Date(h.recordedAt).getTime() - new Date(h.time).getTime()) > lateThresholdMs
+    ).length;
+
+    const adjustedExpected = Math.max(expected - lateFallbackCount, 1);
+    const pct = Math.min((online / adjustedExpected) * 100, 100);
+    return Math.round(pct * 100) / 100;
+  }
+
+  // Prune to retention window
   pruneOld() {
     const cutoff = Date.now() - this.RETENTION_MS;
-    this.heartbeats = this.heartbeats.filter(
-      h => new Date(h.time).getTime() > cutoff
-    );
+    this.heartbeats = this.heartbeats.filter(h => new Date(h.time).getTime() > cutoff);
   }
 }
 
@@ -237,29 +314,56 @@ export default {
     let botName = 'default';
     let actionPath = url.pathname;
 
-    if (segments.length === 0 || (segments.length === 1 && segments[0] === 'api')) {
+    if (segments.length === 0) {
       return new Response('Not Found', { status: 404 });
     }
 
-    if (segments[0] === 'api' && segments[1] === 'status') {
-      actionPath = '/status';
+    // If top-level /api/status or /api/health etc, map to default bot
+    if (segments[0] === 'api' && segments.length >= 2) {
+      // /api/status, /api/health, /api/history
+      actionPath = '/' + segments.slice(1).join('/');
     } else if (segments[0] === 'heartbeat' && segments.length === 1) {
       actionPath = '/heartbeat';
     } else if (segments.length >= 2) {
+      // Multi-bot path e.g. /botname/status or /botname/heartbeat
       botName = segments[0];
       actionPath = '/' + segments.slice(1).join('/');
+    } else {
+      return new Response('Not Found', { status: 404 });
     }
 
-    // Auth for protected routes
-    if (actionPath.startsWith('/heartbeat') || actionPath.startsWith('/maintenance')) {
-      const authHeader = request.headers.get('Authorization');
-      if (!env.AUTH_TOKEN || authHeader !== `Bearer ${env.AUTH_TOKEN}`) {
-        return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
+    // Protected routes require auth: heartbeat and maintenance actions.
+    const protectedPrefixes = ['/heartbeat', '/maintenance'];
+    if (protectedPrefixes.some(p => actionPath.startsWith(p))) {
+      const authHeader = request.headers.get('Authorization') || '';
+      const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+      // Per-bot secret naming: "<botname>_auth"
+      // Normalize botName to lowercase and replace non-alphanum with underscore to form the env var name:
+      const normalizedBotName = botName.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+      const secretName = `${normalizedBotName}_auth`;
+
+      // Default bot keeps using env.AUTH_TOKEN
+      let token = null;
+      if (botName === 'default') {
+        token = env.AUTH_TOKEN || null;
+      } else {
+        token = env[secretName] || null;
+      }
+
+      if (!token || bearer !== token) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
       }
     }
 
     const id = env.UPTIME_STORAGE.idFromName(botName);
     const stub = env.UPTIME_STORAGE.get(id);
-    return stub.fetch(new Request(url.origin + actionPath, request));
+
+    // Forward request into the Durable Object, remapping the path to the DO's internal path
+    // Preserve querystring for /history etc.
+    const forwardUrl = new URL(request.url);
+    forwardUrl.pathname = actionPath;
+    const forwarded = new Request(forwardUrl.toString(), request);
+    return stub.fetch(forwarded);
   }
 }
