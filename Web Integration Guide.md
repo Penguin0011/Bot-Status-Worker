@@ -61,7 +61,7 @@ Design recommendations for a web dashboard
 - The worker stores heartbeats newest-first. To detect transitions:
   - Look for a status:0 synthetic offline entry followed later by a status:1 heartbeat — indicates offline -> recovery.
   - Combine heartbeat timestamps with ping values for richer diagnostics.
-- If an offline event's insertionMode is "fallback" and recordedAt is long after the offline time, display a tooltip: "This offline marker was inferred when the dashboard polled; it may have been recorded late."
+- If an offline event's insertionMode is "fallback" and recordedAt is long after the offline time, display a tooltip: "This offline marker was inferred when the dashboard polled; it may have been reco[...]"
 
 6. Example UI flow (timeline)
 - Fetch /api/history?limit=200 and show newest-first.
@@ -91,9 +91,7 @@ Design recommendations for a web dashboard
 - If /api/status shows status:1 but /api/health returns 503:
   - Unlikely (health derives from last heartbeat). If observed, confirm the request used 'no-cache' and the same botName path.
 - If you see many fallback offline entries:
-  - The DO alarms may not be firing reliably (cold DO or scheduling delays). The fallback is intentional and preserves an audit trail; consider tuning LATE_OFFLINE_EXCLUSION_HOURS if you want to ignore very-late records in SLA calculations.
-- If you need strict time-based uptime rather than slot-based:
-  - Consider computing uptime from gaps between heartbeats (duration-based) and modify the worker accordingly.
+  - The DO alarms may not be firing reliably (cold DO or scheduling delays). The fallback is intentional and preserves an audit trail; consider tuning LATE_OFFLINE_EXCLUSION_HOURS if you want to ignor[...] 
 
 10. Example JavaScript snippets
 
@@ -143,11 +141,10 @@ async function fetchHistory(domain, limit = 200) {
 - Cursor-based history endpoints (`after`, `before`) for efficient scrolling.
 - Duration-based uptime (compute total offline time vs online time) for more precise SLA reporting.
 - Per-bot configuration: allow each bot to set a custom tolerance or cadence.
-- Alert webhooks on status transitions.
+- Webhook notifications on status transitions (e.g., on offline or recovery).
+- Role-based access or per-bot AUTH tokens.
 
 Appendix — Synthetic offline behavior summary
-- Alarm path: DO schedules an alarm for lastHeartbeat + HEARTBEAT_TOLERANCE_SECONDS on each heartbeat. If it fires and the heartbeat is stale, DO inserts a synthetic offline event with insertionMode: "alarm" and recordedAt ~= time of insertion.
-- Fallback path: If the alarm didn't fire (e.g., cold DO), the next /api/status read detects the stale lastHeartbeat and inserts a synthetic offline event with insertionMode: "fallback" and recordedAt that is substantially later than the theoretical offline time. The entry is persisted so the history is complete.
+- Alarm path: DO schedules an alarm for lastHeartbeat + HEARTBEAT_TOLERANCE_SECONDS on each heartbeat. If it fires and the heartbeat is stale, DO inserts a synthetic offline event with insertionMode: [...] 
+- Fallback path: If the alarm didn't fire (e.g., cold DO), the next /api/status read detects the stale lastHeartbeat and inserts a synthetic offline event with insertionMode: "fallback" and recordedAt[...] 
 - Use insertionMode and recordedAt to annotate, filter, or exclude late/inferred offline markers in dashboard analytics.
-
-This should give a clear and practical integration guide for building dashboards, monitoring checks, and automations around the Bot Status Worker.

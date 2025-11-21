@@ -16,6 +16,7 @@ Features
   - uptime: raw slot-based uptime (counts online heartbeats).
   - uptimeAdjusted: ignores very-late synthetic offline markers for SLA-style reporting.
 
+
 Quick example requests
 - Health (fast):
   - curl -H 'Cache-Control: no-cache' https://<domain>/api/health
@@ -94,8 +95,7 @@ Data model notes
 Metrics and how uptime is computed
 - Expected cadence: default 60s (one slot per minute). The system expects 1440 slots per 24h.
 - uptime (raw): counts the number of status:1 entries in the past 24h and divides by expected slots, expressed as percentage (clamped to 100%).
-  - Simple slot-based metric convenient for quick dashboards.
-- uptimeAdjusted: attempts to avoid penalizing uptime when synthetic offline markers were inserted long after their theoretical offline time (e.g., inserted by a fallback on a cold DO or when reads happened long after the transition).
+- uptimeAdjusted: attempts to avoid penalizing uptime when synthetic offline markers were inserted long after their theoretical offline time (e.g., inserted by a fallback on a cold DO or when reads have been infrequent).
   - Each synthetic offline includes:
     - insertionMode: "alarm" (timely) or "fallback" (read-side fallback).
     - recordedAt: when the synthetic offline entry was created.
@@ -113,93 +113,62 @@ Configuration (constants & env)
 - LATE_OFFLINE_EXCLUSION_HOURS (env; default 6)
   - Threshold (hours) to decide whether a synthetic offline event is "late" and should be excluded from adjusted uptime.
 - AUTH_TOKEN (env/secret)
-  - Bearer token required for posting heartbeats and toggling maintenance.
+  - Bearer token required for posting heartbeats and toggling maintenance for the default bot.
+- Per-bot secrets: see "Per-bot Cloudflare secrets" below.
 - Durable Object binding: UPTIME_STORAGE
   - Ensure this DO class is registered in wrangler.toml and bound to the worker.
 
-wrangler.toml example
-```toml
-name = "bot-status"
-main = "worker.js"
-compatibility_date = "2024-11-01"
+Per-bot Cloudflare secrets (new)
+- Purpose
+  - When hosting multiple bots (multi-tenant), you can protect each bot's protected routes (/heartbeat and /maintenance/*) with a distinct Cloudflare secret per bot instead of a single shared token.
+  - The default bot continues to use AUTH_TOKEN (backwards-compatible).
+- Naming convention
+  - For each non-default bot, set a Cloudflare secret named:
+    <normalized-botname>_auth
+  - Normalization rules:
+    - Convert the bot name to lowercase.
+    - Replace any character that is not a lowercase letter, digit, or underscore with an underscore.
+    - Append _auth.
+  - Examples:
+    - Bot name "payment-bot" → secret name payment_bot_auth
+    - Bot name "MyBot" → secret name mybot_auth
+    - Bot name "My-Bot/Prod" → secret name my_bot_prod_auth
+- Path mapping reminders
+  - The worker routes multi-bot requests under /<botname>/..., e.g.:
+    - POST /payment-bot/heartbeat
+    - GET /payment-bot/api/status
+  - When posting heartbeats or toggling maintenance for non-default bots, include Authorization: Bearer <secret> where <secret> matches the bot's per-bot Cloudflare secret value.
+- How to set secrets with wrangler
+  - Default bot (same behavior as before):
+    - wrangler secret put AUTH_TOKEN
+  - Example: store a secret for a bot named "payment-bot"
+    - Normalize to payment_bot_auth, then run:
+      wrangler secret put payment_bot_auth
+    - When posting heartbeats:
+      curl -X POST \
+        -H "Authorization: Bearer $PAYMENT_BOT_AUTH" \
+        -H "Content-Type: application/json" \
+        --data '{"ping":82}' \
+        https://<domain>/payment-bot/heartbeat
+- Behavior notes
+  - Protected routes for non-default bots require the per-bot secret (no fallback to AUTH_TOKEN). This prevents accidental reuse of the default token for other bots.
+  - The default bot uses AUTH_TOKEN for backward compatibility; you may continue to post to /heartbeat and /api/status (or to /default/heartbeat if you prefer explicit namespacing).
+  - For dashboards and monitors that only read status/health/history, no auth is required (these endpoints are publicly readable by default unless you change the worker to restrict them).
+- Security tips
+  - Do not commit secret values to git.
+  - Use wrangler secret put for each secret or a secure vault and inject as environment secrets at deployment time.
+  - Rotate per-bot secrets independently if a single bot is compromised.
 
-[vars]
-# AUTH_TOKEN should be provided as a secret via `wrangler secret put AUTH_TOKEN`
-
-[durable_objects]
-bindings = [
-  { name = "UPTIME_STORAGE", class_name = "UptimeStorage" }
-]
-
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["UptimeStorage"]
-```
-
-Security & CORS
-- Protected routes:
-  - /heartbeat and /maintenance/* require Authorization: Bearer <AUTH_TOKEN>.
-  - Keep AUTH_TOKEN secret (wrangler secret put or Cloudflare dashboard).
-- Status & History endpoints include Access-Control-Allow-Origin: * by default to simplify web integration. For production, restrict this to your permitted origins.
-
-Logging & diagnostics
-- Use `console.log` in the worker for key events (e.g., ALARM fired). Then use:
-  - wrangler tail --format pretty
-  - to inspect run-time logs and alarm firings.
-- If alarms don't appear to run (cold DO edge cases), the read-side fallback inserts a synthetic offline marker when /api/status is next requested.
-
-Testing checklist
-- Normal heartbeat:
-  - Start your bot's heartbeat loop (POST /heartbeat every minute).
-  - /api/status should show status:1 and lastCheck close to now.
-  - /api/health returns 200.
-- Offline detection:
-  - Stop heartbeat loop.
-  - Wait HEARTBEAT_TOLERANCE_SECONDS + ~10s.
-  - /api/status should show status:0 and contain a synthetic offline entry referring to last known heartbeat time.
-  - /api/health should return 503.
-- Fallback path:
-  - Simulate a cold DO or stop heartbeats and do not wait for alarm to fire. Call /api/status after a long gap — the fallback should insert an offline marker and persist it.
-- Maintenance:
-  - POST /maintenance/enable (with auth) → /api/status returns status:2 and suppresses offline entries.
-  - POST /maintenance/disable to return to normal mode.
-
-Potential enhancements
-- Cursor-based pagination for /api/history (after=<ISO> or cursor) for more efficient navigation of large histories.
-- Duration-based uptime instead of slot-counting (compute total online time vs offline time).
-- Per-bot customization for heartbeat tolerances and cadence.
-- Webhook notifications on status transitions (e.g., on offline or recovery).
-- Role-based access or per-bot AUTH tokens.
-
-Appendix: common curl snippets
-
-Heartbeat (POST):
-curl -X POST \
-  -H "Authorization: Bearer $AUTH_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data '{"ping":82}' \
-  https://<domain>/heartbeat
-
-Status:
-curl -H 'Cache-Control: no-cache' https://<domain>/api/status
-
-Health:
-curl -H 'Cache-Control: no-cache' https://<domain>/api/health
-
-History:
-curl -H 'Cache-Control: no-cache' "https://<domain>/api/history?limit=200"
-
-Troubleshooting
-- If status remains online even after stopping heartbeats:
-  - Confirm you actually stopped sending heartbeats and that no other client is posting.
-  - Verify HEARTBEAT_TOLERANCE_SECONDS (default 90s) and wait that amount plus buffer.
-- If synthetic "alarm" entries are missing but fallback works:
-  - The Durable Object alarm may not have fired due to a cold DO or alarm scheduling delays. The fallback insertion on read ensures the offline marker appears and is persisted.
-- If retention needs to be adjusted:
-  - Update RETENTION_MS in code and redeploy. Be aware this only affects future pruning.
-
-License
-- MIT (or adjust to your preferred license).
-
-Contact & contributions
-- Contributions welcome — open issues or PRs with improvements to paging, uptime calculation, or integration examples.
+Quick example requests
+- Health (default bot):
+  - curl -H 'Cache-Control: no-cache' https://<domain>/api/health
+- Status (default bot):
+  - curl -H 'Cache-Control: no-cache' https://<domain>/api/status
+- Status (named bot):
+  - curl -H 'Cache-Control: no-cache' https://<domain>/payment-bot/api/status
+- Heartbeat (named bot, protected):
+  - curl -X POST \
+      -H "Authorization: Bearer $PAYMENT_BOT_AUTH" \
+      -H "Content-Type: application/json" \
+      --data '{"ping":82}' \
+      https://<domain>/payment-bot/heartbeat
