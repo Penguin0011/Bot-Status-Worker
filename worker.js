@@ -14,19 +14,27 @@ export class UptimeStorage {
     this.HEARTBEAT_INTERVAL_SECONDS = 60;    // Expected heartbeat cadence
     this.RETENTION_MS = 48 * 60 * 60 * 1000; // Keep last 48h of entries
 
+    // Track whether state has been initialized
+    this.initialized = false;
+    this.initPromise = this.initializeState();
+  }
+
+  async initializeState() {
     // Load persisted data (Durable Object storage)
-    this.state.storage.get([
+    const data = await this.state.storage.get([
       'heartbeats',
       'lastHeartbeat',
       'maintenance',
       'lastOfflineRecordedForHeartbeatTime'
-    ]).then(data => {
-      this.heartbeats = data.get('heartbeats') || [];
-      this.lastHeartbeat = data.get('lastHeartbeat') || null;
-      this.maintenance = data.get('maintenance') || false;
-      this.lastOfflineRecordedForHeartbeatTime =
-        data.get('lastOfflineRecordedForHeartbeatTime') || null;
-    });
+    ]);
+
+    this.heartbeats = data.get('heartbeats') || [];
+    this.lastHeartbeat = data.get('lastHeartbeat') || null;
+    this.maintenance = data.get('maintenance') || false;
+    this.lastOfflineRecordedForHeartbeatTime =
+      data.get('lastOfflineRecordedForHeartbeatTime') || null;
+
+    this.initialized = true;
   }
 
   // helper to create JSON responses with consistent CORS
@@ -42,6 +50,11 @@ export class UptimeStorage {
 
   // fetch entrypoint (routes inside the DO)
   async fetch(request) {
+    // Ensure state is loaded before processing any request
+    if (!this.initialized) {
+      await this.initPromise;
+    }
+
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -59,6 +72,11 @@ export class UptimeStorage {
   // Alarm callback used to detect and persist "offline" heartbeats
   async alarm() {
     try {
+      // Ensure state is loaded before processing alarm
+      if (!this.initialized) {
+        await this.initPromise;
+      }
+
       if (this.maintenance) return;
       if (!this.lastHeartbeat) return;
 
