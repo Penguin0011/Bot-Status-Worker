@@ -364,11 +364,28 @@ curl https://your-domain.workers.dev/payment-bot/api/status
 - Use `idFromName(botName)` for consistent bot-to-DO mapping
 - Always forward with `new Request(forwardUrl, request)` to preserve headers
 
-### Durable Object Pattern (uptime-storage.mjs)
+### Durable Object Pattern (worker.js UptimeStorage class)
 - Class-based with `constructor(state, env)`
-- Load state asynchronously in constructor via `state.storage.get()`
-- Implement `fetch(request)` for HTTP routing
-- Implement `alarm()` for scheduled tasks
+- **CRITICAL**: Proper state initialization to avoid race conditions:
+  ```javascript
+  constructor(state, env) {
+    this.initialized = false;
+    this.initPromise = this.initializeState();
+  }
+
+  async initializeState() {
+    const data = await this.state.storage.get([...]);
+    // Load state
+    this.initialized = true;
+  }
+
+  async fetch(request) {
+    if (!this.initialized) await this.initPromise;
+    // Handle request with fully-loaded state
+  }
+  ```
+- Implement `fetch(request)` for HTTP routing - **always wait for initialization first**
+- Implement `alarm()` for scheduled tasks - **always wait for initialization first**
 - Use `state.storage.put()` for persistence (batch writes where possible)
 - Helper method `jsonResponse(obj, status)` for consistent responses
 
@@ -564,6 +581,16 @@ See `Web Integration Guide.md` for detailed patterns:
 ---
 
 ## Troubleshooting
+
+### Issue: "No data" shown instead of offline status (CRITICAL - FIXED)
+- **Cause**: Race condition in Durable Object state initialization. The constructor was loading state asynchronously without waiting, causing requests processed immediately after DO wake-up to see uninitialized state (`lastHeartbeat: null`, `heartbeats: []`)
+- **Symptoms**: Frontend shows "no data" when bot goes offline; status returns `status: 0` with empty `heartbeatList` and `lastCheck: null`
+- **Fix**: Implemented proper async state initialization pattern:
+  - Added `initializeState()` method that awaits storage load
+  - Added `initialized` flag and `initPromise` to track state
+  - Both `fetch()` and `alarm()` now wait for `initPromise` before processing
+- **Location**: `worker.js` lines 17-38, 52-56, 73-78
+- **Impact**: Ensures all requests see fully-loaded state, preventing "no data" display
 
 ### Issue: Heartbeat returns 401
 - **Cause**: Invalid or missing `Authorization` header
