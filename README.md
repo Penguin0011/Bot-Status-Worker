@@ -4,7 +4,7 @@ A small Cloudflare Worker + Durable Object service to collect periodic heartbeat
 
 Features
 - Durable Object stores recent heartbeats and events (48h default retention).
-- /api/heartbeat (protected) — accept periodic heartbeats (ping in ms).
+- /heartbeat (protected) — accept periodic heartbeats (ping in ms).
 - /api/status — full status, uptime metrics, and recent event list.
 - /api/health — minimal, monitor-friendly health endpoint (HTTP 200/503).
 - /api/history?limit=… — paginated recent events (newest-first).
@@ -26,6 +26,20 @@ Quick example requests
   - curl -H 'Cache-Control: no-cache' "https://<domain>/api/history?limit=200"
 - Heartbeat (protected, POST):
   - curl -X POST -H "Authorization: Bearer $AUTH_TOKEN" -H "Content-Type: application/json" --data '{"ping":82}' https://<domain>/heartbeat
+
+Local development and testing
+- Requirements: Node.js 20+ and a Cloudflare account (free tier is enough for deployment; not needed for tests).
+- Install dev tooling (wrangler): `npm install`
+- Run the unit tests (no Cloudflare account needed): `npm test`
+- Verify the worker bundles without deploying: `npm run check`
+- Run locally with miniflare: copy `.dev.vars.example` to `.dev.vars` (git-ignored), set `AUTH_TOKEN`, then `npm run dev` and try `curl http://localhost:8787/api/health`.
+- Deploy: `npx wrangler deploy`, then set secrets with `npx wrangler secret put AUTH_TOKEN` (and one `<botname>_auth` per named bot).
+
+Routing summary
+- Default bot: `/api/status`, `/api/health`, `/api/history`, `/heartbeat` (or `/api/heartbeat`), `/maintenance/enable|disable` (or `/api/maintenance/...`).
+- Named bots: `/<botname>/status|health|history|heartbeat|maintenance/...`; the `api` prefix is optional, so `/<botname>/api/status` also works.
+- Reserved names: `api`, `heartbeat` and `maintenance` cannot be used as bot names because they select the default bot. Bot names are limited to 64 characters and are case-sensitive for storage (`MyBot` and `mybot` are different bots) but share one secret name after normalization (see below).
+- Any other path returns 404 before a Durable Object is touched.
 
 API Reference
 
@@ -80,8 +94,9 @@ API Reference
 
 5. /maintenance/enable and /maintenance/disable
 - Purpose: mark planned maintenance windows so offline detection is suppressed.
-- Method: POST
+- Method: POST (GET returns 405)
 - Protected: requires Authorization: Bearer <AUTH_TOKEN>
+- Also reachable as /api/maintenance/enable|disable and /<botname>/maintenance/enable|disable.
 - Behavior:
   - Adds a status:2 maintenance event to history.
   - While maintenance is enabled offline insertion (alarm/fallback) is skipped.
@@ -118,7 +133,7 @@ Configuration (constants & env)
 - Durable Object binding: UPTIME_STORAGE
   - Ensure this DO class is registered in wrangler.toml and bound to the worker.
 
-Per-bot Cloudflare secrets (new)
+Per-bot Cloudflare secrets
 - Purpose
   - When hosting multiple bots (multi-tenant), you can protect each bot's protected routes (/heartbeat and /maintenance/*) with a distinct Cloudflare secret per bot instead of a single shared token.
   - The default bot continues to use AUTH_TOKEN (backwards-compatible).
@@ -172,3 +187,13 @@ Quick example requests
       -H "Content-Type: application/json" \
       --data '{"ping":82}' \
       https://<domain>/payment-bot/heartbeat
+
+Security notes
+- Read endpoints (/api/status, /api/health, /api/history and their per-bot forms) are public and unauthenticated by design; they expose heartbeat timestamps and ping values. Restrict them in worker.js if that is not acceptable for your deployment.
+- Bearer tokens are compared in constant time. Tokens are never logged or echoed in responses.
+- There is no built-in rate limiting; use Cloudflare rate-limiting rules or WAF if abuse of the public read endpoints is a concern.
+- Never commit `.dev.vars` or real tokens. CI runs a gitleaks scan on every push and pull request.
+- To report a vulnerability, see SECURITY.md.
+
+License
+- MIT. See LICENSE.
