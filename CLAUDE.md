@@ -59,6 +59,7 @@ Bot-Status-Worker/
 ├── .github/workflows/ci.yml     # CI: tests, wrangler dry-run, gitleaks secret scan
 ├── README.md                    # User-facing documentation
 ├── SECURITY.md                  # Vulnerability reporting
+├── LICENSE                      # MIT
 ├── Web Integration Guide.md     # Dashboard/UI integration guide
 ├── cog/
 │   └── pushstatus.py           # Example Discord bot heartbeat client

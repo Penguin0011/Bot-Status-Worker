@@ -196,4 +196,4 @@ Security notes
 - To report a vulnerability, see SECURITY.md.
 
 License
-- No license file is included yet. Until one is added, the code is "all rights reserved" by default and others may not legally reuse it.
+- MIT. See LICENSE.
