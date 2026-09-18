@@ -158,7 +158,8 @@ export class UptimeStorage {
   // History endpoint (paginated newest-first)
   handleHistory(request) {
     const url = new URL(request.url);
-    const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '100', 1), 1), 1000);
+    const parsed = parseInt(url.searchParams.get('limit') || '100', 10);
+    const limit = Math.min(Math.max(Number.isFinite(parsed) ? parsed : 100, 1), 1000);
 
     const items = this.heartbeats.slice(0, limit); // newest-first
     return this.jsonResponse({
@@ -246,15 +247,14 @@ export class UptimeStorage {
     let body = {};
     try {
       if (request.headers.get('Content-Type')?.includes('application/json')) {
-        body = await request.json();
+        const parsed = await request.json();
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed;
       }
     } catch (e) {}
 
-    const hb = {
-      status: 1,
-      time: timestamp,
-      ping: body.ping !== undefined ? Math.round(body.ping) : undefined
-    };
+    // Only accept a finite numeric ping; anything else is dropped rather than stored as NaN/null.
+    const ping = typeof body.ping === 'number' && Number.isFinite(body.ping) ? Math.round(body.ping) : undefined;
+    const hb = { status: 1, time: timestamp, ping };
 
     this.lastHeartbeat = hb;
     this.heartbeats.unshift(hb);
@@ -313,46 +313,93 @@ export class UptimeStorage {
   }
 }
 
+// Path segments that can never be bot names because they select the default bot.
+const RESERVED_TOP_LEVEL = new Set(['api', 'heartbeat', 'maintenance']);
+// Actions the Durable Object understands; anything else is rejected before a DO is touched.
+const KNOWN_ACTIONS = new Set(['/heartbeat', '/status', '/health', '/history', '/maintenance/enable', '/maintenance/disable']);
+const MAX_BOT_NAME_LENGTH = 64;
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+};
+
+/**
+ * Constant-time string comparison so bearer-token checks don't leak
+ * how many leading characters matched through response timing.
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+export function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = new TextEncoder().encode(a);
+  const bufB = new TextEncoder().encode(b);
+  let diff = bufA.length ^ bufB.length;
+  const len = Math.max(bufA.length, bufB.length);
+  for (let i = 0; i < len; i++) {
+    diff |= (bufA[i % bufA.length] ?? 0) ^ (bufB[i % bufB.length] ?? 0);
+  }
+  return diff === 0;
+}
+
+/**
+ * Resolves a request path to a bot name and the action to forward to its Durable Object.
+ * Supported shapes (see README):
+ *   /api/<action>           -> default bot
+ *   /heartbeat, /maintenance/<x> -> default bot
+ *   /<bot>/<action>         -> named bot
+ *   /<bot>/api/<action>     -> named bot (the "api" prefix is optional for named bots)
+ * @param {string} pathname
+ * @returns {{ botName: string, actionPath: string } | null} null when the path is not routable
+ */
+export function resolveRoute(pathname) {
+  const segments = pathname.split('/').filter(Boolean);
+  if (segments.length === 0) return null;
+
+  let botName = 'default';
+  let rest = segments;
+
+  if (!RESERVED_TOP_LEVEL.has(segments[0])) {
+    // Multi-bot path: /<botname>/...
+    botName = segments[0];
+    rest = segments.slice(1);
+    if (botName.length > MAX_BOT_NAME_LENGTH) return null;
+  }
+
+  // Optional "api" prefix: /api/status, /<bot>/api/status
+  if (rest[0] === 'api') rest = rest.slice(1);
+  if (rest.length === 0) return null;
+
+  const actionPath = '/' + rest.join('/');
+  if (!KNOWN_ACTIONS.has(actionPath)) return null;
+  return { botName, actionPath };
+}
+
 // Worker entrypoint with multi-bot routing (/:bot/... support)
 export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization'
-        }
-      });
+      return new Response(null, { headers: CORS_HEADERS });
     }
 
     const url = new URL(request.url);
-    const segments = url.pathname.split('/').filter(Boolean);
-
-    let botName = 'default';
-    let actionPath = url.pathname;
-
-    if (segments.length === 0) {
+    const route = resolveRoute(url.pathname);
+    if (!route) {
       return new Response('Not Found', { status: 404 });
     }
-
-    // If top-level /api/status or /api/health etc, map to default bot
-    if (segments[0] === 'api' && segments.length >= 2) {
-      // /api/status, /api/health, /api/history
-      actionPath = '/' + segments.slice(1).join('/');
-    } else if (segments[0] === 'heartbeat' && segments.length === 1) {
-      actionPath = '/heartbeat';
-    } else if (segments.length >= 2) {
-      // Multi-bot path e.g. /botname/status or /botname/heartbeat
-      botName = segments[0];
-      actionPath = '/' + segments.slice(1).join('/');
-    } else {
-      return new Response('Not Found', { status: 404 });
-    }
+    const { botName, actionPath } = route;
 
     // Protected routes require auth: heartbeat and maintenance actions.
     const protectedPrefixes = ['/heartbeat', '/maintenance'];
     if (protectedPrefixes.some(p => actionPath.startsWith(p))) {
+      if (request.method !== 'POST') {
+        return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
+          status: 405,
+          headers: { 'Content-Type': 'application/json', Allow: 'POST', ...CORS_HEADERS }
+        });
+      }
       const authHeader = request.headers.get('Authorization') || '';
       const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
@@ -369,8 +416,11 @@ export default {
         token = env[secretName] || null;
       }
 
-      if (!token || bearer !== token) {
-        return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+      if (!token || bearer === null || !timingSafeEqual(bearer, token)) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json', ...CORS_HEADERS }
+        });
       }
     }
 

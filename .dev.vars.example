@@ -1,0 +1,12 @@
+# Local development secrets for `wrangler dev`.
+# Copy to `.dev.vars` (git-ignored) and replace the placeholder values.
+# In production set these with `wrangler secret put <NAME>` instead.
+
+# Bearer token for the default bot's protected routes (/heartbeat, /maintenance/*)
+AUTH_TOKEN=replace-with-a-long-random-token
+
+# Per-bot tokens: <normalized-botname>_auth  (e.g. "payment-bot" -> payment_bot_auth)
+# payment_bot_auth=replace-with-another-random-token
+
+# Optional: hours after which a late fallback offline marker is excluded from uptimeAdjusted (default 6)
+# LATE_OFFLINE_EXCLUSION_HOURS=6

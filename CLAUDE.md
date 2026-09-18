@@ -24,8 +24,8 @@
    - Supports both default bot (`/api/status`) and multi-bot paths (`/<botname>/api/status`)
    - Forwards requests to appropriate Durable Object instances
 
-2. **Durable Object (`uptime-storage.mjs`)**
-   - Class: `UptimeStorage`
+2. **Durable Object (`UptimeStorage` class in `worker.js`)**
+   - Class: `UptimeStorage`, exported from the same module as the worker
    - Manages state for a single bot: heartbeats, maintenance status, offline tracking
    - Implements alarm-based synthetic offline insertion
    - Provides all API endpoints: `/heartbeat`, `/status`, `/health`, `/history`, `/maintenance/*`
@@ -38,6 +38,11 @@
 4. **Client Example (`cog/pushstatus.py`)**
    - Discord.py cog demonstrating heartbeat posting
    - Posts ping metrics every 60s with bearer token auth
+   - URL and token come from `PUSHSTATUS_URL` / `PUSHTOKEN` environment variables
+
+5. **Tests (`test/worker.test.mjs`)**
+   - `node --test` unit tests with an in-memory Durable Object state double
+   - Cover routing, auth, input hardening, history pagination, offline detection, cold start
 
 ---
 
@@ -45,10 +50,15 @@
 
 ```
 Bot-Status-Worker/
-├── worker.js                    # Main worker entry point (routing, auth, multi-bot)
-├── uptime-storage.mjs           # Durable Object class (state, API endpoints)
+├── worker.js                    # Worker entry point (routing, auth) + UptimeStorage Durable Object
 ├── wrangler.toml                # Cloudflare Workers config
+├── package.json                 # npm scripts (test, check, dev, deploy) + wrangler dev dependency
+├── .dev.vars.example            # Template for local secrets (copy to .dev.vars, git-ignored)
+├── test/
+│   └── worker.test.mjs         # Unit tests (node --test)
+├── .github/workflows/ci.yml     # CI: tests, wrangler dry-run, gitleaks secret scan
 ├── README.md                    # User-facing documentation
+├── SECURITY.md                  # Vulnerability reporting
 ├── Web Integration Guide.md     # Dashboard/UI integration guide
 ├── cog/
 │   └── pushstatus.py           # Example Discord bot heartbeat client
@@ -57,20 +67,15 @@ Bot-Status-Worker/
 
 ### File Descriptions
 
-- **`worker.js`** (368 lines)
-  - Exports default object with `fetch()` handler
-  - Multi-bot routing: extracts bot name from URL path
-  - Auth: protects `/heartbeat` and `/maintenance/*` with bearer tokens
-  - Per-bot secrets: `<normalized_botname>_auth` for non-default bots
-  - Default bot uses `AUTH_TOKEN` environment variable
-
-- **`uptime-storage.mjs`** (296 lines)
-  - Exports `UptimeStorage` class
-  - Constructor loads state from Durable Object storage
-  - Implements `fetch()` for internal routing
-  - Implements `alarm()` for synthetic offline detection
+- **`worker.js`**
+  - Exports default object with `fetch()` handler, plus `UptimeStorage`, `resolveRoute`, `timingSafeEqual`
+  - `resolveRoute()`: maps a path to `{ botName, actionPath }`; rejects unknown actions and over-long bot names before any DO is touched
+  - Auth: protects `/heartbeat` and `/maintenance/*` with bearer tokens (POST only, constant-time compare)
+  - Per-bot secrets: `<normalized_botname>_auth` for non-default bots; default bot uses `AUTH_TOKEN`
+  - `UptimeStorage`: constructor kicks off `initializeState()`; `fetch()`/`alarm()` await it before handling
   - Key methods: `handleHeartbeat`, `handleStatus`, `handleHealth`, `handleHistory`, `handleMaintenance`
   - Uptime calculations: `calculateUptime()` (raw), `calculateUptimeAdjusted()` (SLA-friendly)
+  - Note: the former `uptime-storage.mjs` was an unused, older copy of the DO class and has been removed
 
 - **`wrangler.toml`**
   - Worker name: `bot-status`
@@ -82,7 +87,7 @@ Bot-Status-Worker/
   - Discord bot integration example
   - Uses `discord.ext.tasks` for 60s loop
   - Posts `{"ping": <ms>}` to heartbeat endpoint
-  - Reads `PUSHTOKEN` from environment
+  - Reads `PUSHSTATUS_URL` and `PUSHTOKEN` from environment (never hardcode a real URL or token)
 
 ---
 
@@ -131,10 +136,12 @@ Two uptime calculations over last 24 hours:
   - Use case: avoid penalizing uptime when DO is cold or reads are infrequent
 
 ### 5. Multi-Bot Routing
-- Default bot: `/api/status`, `/heartbeat` (uses `AUTH_TOKEN`)
-- Named bots: `/<botname>/api/status`, `/<botname>/heartbeat` (uses `<botname>_auth` secret)
+- Default bot: `/api/status`, `/heartbeat`, `/maintenance/*` (uses `AUTH_TOKEN`)
+- Named bots: `/<botname>/status` or `/<botname>/api/status`, `/<botname>/heartbeat` (uses `<botname>_auth` secret)
+- Reserved top-level names: `api`, `heartbeat`, `maintenance` (they select the default bot)
+- Bot names: max 64 chars; case-sensitive for storage, normalized for the secret name
 - Each bot gets isolated Durable Object instance via `idFromName(botName)`
-- Bot name normalization: lowercase, replace non-alphanumeric with `_`
+- Bot name normalization (secret lookup only): lowercase, replace non-alphanumeric with `_`
 
 ---
 
@@ -323,6 +330,14 @@ wrangler tail
 
 ### Testing Changes
 
+**Unit tests (no Cloudflare account needed)**:
+```bash
+npm install      # installs wrangler (dev dependency)
+npm test         # node --test with an in-memory DO state double
+npm run check    # wrangler deploy --dry-run (bundles without deploying)
+```
+Add a test in `test/worker.test.mjs` for any routing, auth, or input-handling change.
+
 **Testing heartbeat flow**:
 ```bash
 # Post heartbeat
@@ -364,7 +379,7 @@ curl https://your-domain.workers.dev/payment-bot/api/status
 - Use `idFromName(botName)` for consistent bot-to-DO mapping
 - Always forward with `new Request(forwardUrl, request)` to preserve headers
 
-### Durable Object Pattern (worker.js UptimeStorage class)
+### Durable Object Pattern (`UptimeStorage` class in worker.js)
 - Class-based with `constructor(state, env)`
 - **CRITICAL**: Proper state initialization to avoid race conditions:
   ```javascript
@@ -589,8 +604,9 @@ See `Web Integration Guide.md` for detailed patterns:
   - Added `initializeState()` method that awaits storage load
   - Added `initialized` flag and `initPromise` to track state
   - Both `fetch()` and `alarm()` now wait for `initPromise` before processing
-- **Location**: `worker.js` lines 17-38, 52-56, 73-78
+- **Location**: `worker.js` (`initializeState()`, and the `await this.initPromise` guards in `fetch()` and `alarm()`)
 - **Impact**: Ensures all requests see fully-loaded state, preventing "no data" display
+- **Regression test**: "state survives a cold start" in `test/worker.test.mjs`
 
 ### Issue: Heartbeat returns 401
 - **Cause**: Invalid or missing `Authorization` header
@@ -705,6 +721,7 @@ calculateUptime(recentList) { ... }
 ## Changelog
 
 ### Recent Changes
+- **2026-09** - Pre-publication hardening: fixed `/api/history` always returning no items (`parseInt` radix bug), fixed `/<bot>/api/*` and top-level `/maintenance/*` routes returning 404, constant-time token compare, POST-only protected routes, heartbeat body validation, removed unused `uptime-storage.mjs`, added tests, CI (tests + gitleaks), `.gitignore`, `.dev.vars.example`, SECURITY.md
 - **2025-01** - Added per-bot Cloudflare secrets support
 - **2025-01** - Implemented `uptimeAdjusted` metric with late offline exclusion
 - **2025-01** - Added `/api/health` endpoint for monitors
@@ -725,6 +742,6 @@ When contributing:
 
 ---
 
-**Last Updated**: 2025-01-23
+**Last Updated**: 2026-09-18
 **Maintainer**: Penguin0011
 **AI Assistant Note**: This document is optimized for AI code assistants. When working on this codebase, always refer to the architecture, data model, and development workflow sections above. Pay special attention to state management patterns and the dual offline detection mechanism (alarm + fallback).

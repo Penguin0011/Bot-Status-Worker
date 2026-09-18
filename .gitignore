@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Wrangler local state and secrets
+.wrangler/
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# Environment files (never commit real tokens)
+.env
+.env.*
+!.env.example
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+
+# Python (example cog)
+__pycache__/
+*.pyc
